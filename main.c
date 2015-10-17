@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -87,6 +88,24 @@ void write_response(int sockfd,
   write(sockfd, buf, buflen);
 }
 
+void write_404(int sockfd) {
+  const char not_found_message[] =
+      "Requested file was not found on this server";
+  write_response(sockfd,
+    404, "Not Found",
+    "text/plain",
+    not_found_message, sizeof(not_found_message));
+}
+
+void write_400(int sockfd) {
+  const char bad_request_message[] =
+      "Bad request. Try something else.";
+  write_response(sockfd,
+    400, "Bad request",
+    "text/plain",
+    bad_request_message, sizeof(bad_request_message));
+}
+
 void write_file_response(char* file_path, int sockfd) {
   char* name = basename(file_path);
   const char* ext = strrchr(name, '.');
@@ -95,12 +114,23 @@ void write_file_response(char* file_path, int sockfd) {
     ext_to_mime(ext+1, mime_buf);
   }
 
+  struct stat file_stat;
   int fd = open(file_path, O_RDONLY);
-  if (fd != -1) {
-    struct stat file_stat;
-    fstat(fd, &file_stat);
-    int file_len = file_stat.st_size;
 
+  if (fd != -1) {
+    fstat(fd, &file_stat);
+    if (S_ISDIR (file_stat.st_mode)) {
+      strcat(file_path, "/index.html");
+      ext_to_mime("html", mime_buf);
+      fd = open(file_path, O_RDONLY);
+      fstat(fd, &file_stat);
+    }
+  }
+
+  puts(file_path);
+
+  if (fd != -1) {
+    int file_len = file_stat.st_size;
     write_header(sockfd, 200, "OK", file_len, mime_buf);
 
     const int READ_BUF_SIZE = 1024;
@@ -118,13 +148,9 @@ void write_file_response(char* file_path, int sockfd) {
       }
     } while(read_size > 0);
 
+    close(fd);
   } else {
-    const char not_found_message[] =
-      "Requested file was not found on this server";
-    write_response(sockfd,
-      404, "Not Found",
-      "text/plain",
-      not_found_message, sizeof(not_found_message));
+    write_404(sockfd);
   }
 }
 
@@ -141,9 +167,64 @@ int setnonblocking(int fd) {
 #endif
 }
 
+void replace_percents(char* path, int path_len) {
+  char buf[512];
+  int pos = 0, bpos = 0;
+  while (pos < path_len) {
+    if (path[pos] != '%') {
+      buf[bpos] = path[pos];
+      bpos++;
+      pos++;
+    } else {
+      if ((path_len - pos) >= 3 &&
+          isxdigit(path[pos + 1]) &&
+          isxdigit(path[pos + 2])) {
+        char hex[3];
+        hex[0] = path[pos + 1];
+        hex[1] = path[pos + 2];
+        hex[2] = '\0';
+
+        int hexnum;
+        sscanf(hex, "%x", &hexnum);
+
+        buf[bpos] = (char) hexnum;
+        pos += 3;
+        bpos++;
+      } else {
+        buf[bpos] = path[pos];
+        bpos++;
+        pos++;
+      }
+    }
+  }
+  buf[bpos] = '\0';
+  strcpy(path, buf);
+}
+
+void dispatch_request(const char* request, int req_len, int sockfd) {
+  const char ROOT_DIR[] = "/home/mihanik/Desktop/Hedgehog HTTP Server/";
+
+  if (req_len > 0) {
+    char req_path[512];
+    sscanf(request, "GET %511s HTTP/1.1\n", req_path);
+    int len = strlen(req_path);
+    replace_percents(req_path, len);
+
+    if (!strstr(req_path, "..")) {
+      char path[256];
+      strcpy(path, ROOT_DIR);
+      strcat(path, req_path);
+
+      write_file_response(path, sockfd);
+    } else {
+      write_400(sockfd);
+    }
+    close(sockfd);
+  }
+}
+
 int main(void) {
   int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  DBG_INT(sockfd);
 
   struct sockaddr_in server_addr;
   server_addr.sin_family = AF_INET;
@@ -161,30 +242,24 @@ int main(void) {
   epollfd = epoll_create1(0);
   ev.events = EPOLLIN | EPOLLET;
   ev.data.fd = sockfd;
-  DBG_INT(epoll_ctl(epollfd, EPOLL_CTL_ADD, sockfd, &ev));
+  epoll_ctl(epollfd, EPOLL_CTL_ADD, sockfd, &ev);
 
   char buf[256];
   memset(buf, 256, 0);
 
   for(;;) {
-    DBG_STR("waiting");
     nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
-    DBG_STR("waited");
 
     int n;
     for (n = 0; n < nfds; n++) {
       if (events[n].data.fd == sockfd) {
         while(1) {
-          DBG_STR("if");
           struct sockaddr_in client;
           int addrlen = sizeof(client);
           int acc = accept(sockfd, (struct sockaddr*) &client, (socklen_t*) &addrlen);
           if (-1 == acc) {
             if ((errno == EAGAIN) ||
                 (errno == EWOULDBLOCK)) {
-              DBG_INT(errno);
-              DBG_INT(EAGAIN);
-              DBG_INT(EWOULDBLOCK);
               break;
             } else {
               perror ("accept");
@@ -192,28 +267,14 @@ int main(void) {
             }
           }
 
-          DBG_INT(acc);
-
-          DBG_INT(setnonblocking(acc));
+          setnonblocking(acc);
           ev.events = EPOLLIN | EPOLLET;
           ev.data.fd = acc;
-          DBG_INT(epoll_ctl(epollfd, EPOLL_CTL_ADD, acc, &ev));
+          epoll_ctl(epollfd, EPOLL_CTL_ADD, acc, &ev);
         }
       } else {
-        DBG_STR("else");
-        DBG_INT(events[n].data.fd);
-        DBG_ADR(buf);
-        DBG_ADR(&events[n]);
-
         int input_len = read(events[n].data.fd, buf, 245);
-        if (input_len > 0) {
-          puts(buf);
-
-          write_file_response("index.html", events[n].data.fd);
-          //const char* resp = "Hello, world!";
-          //write_response(events[n].data.fd, 200, "OK", "text/html", resp, strlen(resp));
-          close(events[n].data.fd);
-        }
+        dispatch_request(buf, input_len, events[n].data.fd);
       }
     }
   }
