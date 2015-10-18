@@ -208,9 +208,18 @@ void replace_percents(char* path, int path_len) {
   strcpy(path, buf);
 }
 
-void dispatch_request(const char* request, int req_len, int sockfd) {
-  const char ROOT_DIR[] = "/home/mihanik/Desktop/Hedgehog HTTP Server/";
+struct initvals {
+  int nCPU;
+  char root_dir[256];
+  int port;
+};
 
+const struct initvals DEFAULT_INITIALS = {
+  4, "/home/mihanik/Desktop/Hedgehog HTTP Server/", 8080
+};
+
+void dispatch_request(const char* request, int req_len, int sockfd,
+  struct initvals inits) {
   if (req_len > 0) {
     char req_path[512];
     sscanf(request, "GET %412s HTTP/1.1\n", req_path);
@@ -220,7 +229,7 @@ void dispatch_request(const char* request, int req_len, int sockfd) {
 
     if (!strstr(req_path, "..")) {
       char path[256];
-      strcpy(path, ROOT_DIR);
+      strcpy(path, inits.root_dir);
       strcat(path, req_path);
 
       write_file_response(path, sockfd);
@@ -231,9 +240,61 @@ void dispatch_request(const char* request, int req_len, int sockfd) {
   }
 }
 
-int main(void) {
-  int numCPU = 4;
-  for (int i = 1; i < numCPU; i++) {
+typedef void (*initializer)(int, int*, char**, struct initvals*);
+
+void nCPU_init(int argc, int* pos, char** argv, struct initvals* out) {
+  out->nCPU = atoi(argv[++(*pos) ]);
+}
+
+void root_dir_init(int argc, int* pos,
+  char** argv,
+  struct initvals* out) {
+  strncpy(out->root_dir, argv[++(*pos)], 250);
+}
+
+void port_init(int argc, int* pos, char** argv, struct initvals* out) {
+  out->port = atoi(argv[++(*pos)]);
+}
+
+void initialize(int argc, char** argv,
+  struct initvals* out,
+  int argnum,
+  const char* arguments[],
+  initializer initializers[]) {
+  int i = 1;
+  while (i < argc) {
+    for (int j = 0; j < argnum; j++) {
+      if (!strcmp(argv[i], arguments[j])) {
+        initializers[j](argc, &i, argv, out);
+        break;
+      }
+    }
+    i++;
+  }
+
+  int plen = strlen(out->root_dir);
+  if(plen > 0 && out->root_dir[plen-1] != '/') {
+    out->root_dir[plen] = '/';
+    out->root_dir[plen + 1] = '\0';
+  }
+}
+
+void print_initial(const struct initvals* inits) {
+  printf("Starging Hedgehog HTTP Server\n\
+On port: %d\n\
+Process number: %d\n\
+Root directory: %s\n", inits->port, inits->nCPU, inits->root_dir);
+}
+
+int main(int argc, char** argv) {
+  struct initvals inits = DEFAULT_INITIALS;
+  const char* arguments[] = {"-r", "-c", "-p"};
+  initializer initializers[] = {root_dir_init, nCPU_init, port_init};
+  initialize(argc, argv, &inits, 2, arguments, initializers);
+
+  print_initial(&inits);
+
+  for (int i = 1; i < inits.nCPU; i++) {
     int pid = fork();
     if (pid == 0)
       break;
@@ -243,7 +304,7 @@ int main(void) {
 
   struct sockaddr_in server_addr;
   server_addr.sin_family = AF_INET;
-  server_addr.sin_port = htons(8080);
+  server_addr.sin_port = htons(inits.port);
   server_addr.sin_addr.s_addr = INADDR_ANY;
 
   bind(sockfd, (struct sockaddr*) &server_addr, sizeof(server_addr));
@@ -289,7 +350,7 @@ int main(void) {
         }
       } else {
         int input_len = read(events[n].data.fd, buf, 245);
-        dispatch_request(buf, input_len, events[n].data.fd);
+        dispatch_request(buf, input_len, events[n].data.fd, inits);
       }
     }
   }
