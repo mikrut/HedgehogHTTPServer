@@ -106,32 +106,39 @@ void write_400(int sockfd) {
     bad_request_message, sizeof(bad_request_message));
 }
 
-void write_file_response(char* file_path, int sockfd) {
+int getfd_for_path(char* req_path, struct stat* file_stat) {
+  int fd = open(req_path, O_RDONLY);
+
+  if (fd != -1) {
+    fstat(fd, file_stat);
+    if (S_ISDIR (file_stat->st_mode)) {
+      strcat(req_path, "/index.html");
+      fd = open(req_path, O_RDONLY);
+      fstat(fd, file_stat);
+    }
+  }
+  return fd;
+}
+
+void get_mime_for_path(char* file_path, char* mime_buf) {
   char* name = basename(file_path);
   const char* ext = strrchr(name, '.');
-  char mime_buf[64];
+
   if ((ext != NULL)) {
     ext_to_mime(ext+1, mime_buf);
   }
+}
+
+void write_file_response(char* req_path, int sockfd) {
+  char mime[64];
 
   struct stat file_stat;
-  int fd = open(file_path, O_RDONLY);
-
-  if (fd != -1) {
-    fstat(fd, &file_stat);
-    if (S_ISDIR (file_stat.st_mode)) {
-      strcat(file_path, "/index.html");
-      ext_to_mime("html", mime_buf);
-      fd = open(file_path, O_RDONLY);
-      fstat(fd, &file_stat);
-    }
-  }
-
-  puts(file_path);
+  int fd = getfd_for_path(req_path, &file_stat);
 
   if (fd != -1) {
     int file_len = file_stat.st_size;
-    write_header(sockfd, 200, "OK", file_len, mime_buf);
+    get_mime_for_path(req_path, mime);
+    write_header(sockfd, 200, "OK", file_len, mime);
 
     const int READ_BUF_SIZE = 1024;
     char read_buf[READ_BUF_SIZE];
@@ -206,7 +213,8 @@ void dispatch_request(const char* request, int req_len, int sockfd) {
 
   if (req_len > 0) {
     char req_path[512];
-    sscanf(request, "GET %511s HTTP/1.1\n", req_path);
+    sscanf(request, "GET %412s HTTP/1.1\n", req_path);
+
     int len = strlen(req_path);
     replace_percents(req_path, len);
 
@@ -224,6 +232,13 @@ void dispatch_request(const char* request, int req_len, int sockfd) {
 }
 
 int main(void) {
+  int numCPU = 4;
+  for (int i = 1; i < numCPU; i++) {
+    int pid = fork();
+    if (pid == 0)
+      break;
+  }
+
   int sockfd = socket(AF_INET, SOCK_STREAM, 0);
 
   struct sockaddr_in server_addr;
