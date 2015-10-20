@@ -21,6 +21,15 @@
 #define DBG_STR(str) puts((str))
 #define DBG_ADR(adr) printf(#adr" = %p\n", (adr))
 
+struct send_data {
+  int sockfd;
+  int fd;
+  char* buf;
+  int bsize;
+  int bpos;
+  int blen;
+};
+
 const int ext_cmp_len = 5;
 
 int in(const char** array, int arr_len, const char* str) {
@@ -30,8 +39,13 @@ int in(const char** array, int arr_len, const char* str) {
   return false;
 }
 
-void ext_to_mime(const char* ext, char* result) {
-  const char* images[] = {"jpg", "jpeg", "png", "gif"};
+void ext_to_mime(const char* _ext, char* result) {
+  char ext[10] = "";
+  strncpy(ext, _ext, 8);
+  if (!strcmp(ext, "jpg"))
+    strcpy(ext, "jpeg");
+
+  const char* images[] = {"jpeg", "png", "gif"};
   const char* texts[] = {"html", "css"};
 
   if (ext != NULL) {
@@ -42,7 +56,7 @@ void ext_to_mime(const char* ext, char* result) {
       strncpy(result, "text/", 6);
       strncat(result, ext, ext_cmp_len);
     } else if (!strncmp(ext, "swf", ext_cmp_len)) {
-      const char swf_mime[] = "application/vnd.adobe.flash-movie";
+      const char swf_mime[] = "application/x-shockwave-flash";
       strncpy(result, swf_mime, sizeof(swf_mime));
     } else if (!strncmp(ext, "js", ext_cmp_len)){
       const char js_mime[] = "application/javascript";
@@ -60,22 +74,22 @@ void ext_to_mime(const char* ext, char* result) {
 void write_header(int sockfd,
                  int status_code, const char* status_string,
                  int content_length, const char* content_type) {
-  const char* response_header_template = "\
-HTTP/1.1 %d %s\n\
-Server: HedgehogHTTPServer\n\
-Content-Language: en, ru\n\
-Content-Length: %d\n\
-Content-Type: %s\n\
-Connection: close\n\
-\n";
+  char response_header_template[] = "\
+HTTP/1.1 %d %s\r\n\
+Server: Hedgehog HTTP Server\r\n\
+Content-Language: en, ru\r\n\
+Content-Length: %d\r\n\
+Content-Type: %s\r\n\
+Connection: close\r\n\
+\r\n";
   int header_size = strlen(response_header_template) + 4 + 10 + strlen(content_type);
   char* header = (char*) malloc(sizeof(char) * header_size);
   sprintf(header, response_header_template, status_code, status_string,
           content_length, content_type);
   int header_true_len = strlen(header);
 
-  puts(header);
   write(sockfd, header, header_true_len);
+  free(header);
 }
 
 void write_response(int sockfd,
@@ -83,18 +97,7 @@ void write_response(int sockfd,
                     const char* content_type,
                     const char* buf, size_t buflen) {
   write_header(sockfd, status_code, status_string, buflen, content_type);
-
-  puts(buf);
   write(sockfd, buf, buflen);
-}
-
-void write_404(int sockfd) {
-  const char not_found_message[] =
-      "Requested file was not found on this server";
-  write_response(sockfd,
-    404, "Not Found",
-    "text/plain",
-    not_found_message, sizeof(not_found_message));
 }
 
 void write_400(int sockfd) {
@@ -106,12 +109,123 @@ void write_400(int sockfd) {
     bad_request_message, sizeof(bad_request_message));
 }
 
-int getfd_for_path(char* req_path, struct stat* file_stat) {
+void write_403(int sockfd) {
+  const char forbidden_message[] =
+      "Access to this directory is forbidden!";
+  write_response(sockfd,
+    403, "Forbidden",
+    "text/plain",
+    forbidden_message, sizeof(forbidden_message));
+}
+
+void write_404(int sockfd) {
+  const char not_found_message[] =
+      "Requested file was not found on this server";
+  write_response(sockfd,
+    404, "Not Found",
+    "text/plain",
+    not_found_message, sizeof(not_found_message));
+}
+
+void write_501(int sockfd) {
+ const char not_implemented_message[] =
+      "This method is not implemented or is unknown for server";
+  write_response(sockfd,
+    501, "Not Implemented",
+    "text/plain",
+    not_implemented_message, sizeof(not_implemented_message));
+}
+
+void sockdata_init(struct send_data* sockdata, int fd, int sockfd) {
+  sockdata->bsize = 1024;
+  sockdata->buf = malloc(sizeof(char) * sockdata->bsize);
+  sockdata->blen = sockdata->bpos = 0;
+  sockdata->fd = fd;
+  sockdata->sockfd = sockfd;
+}
+
+void sockdata_fin(struct send_data* sockdata) {
+  if (sockdata->fd != -1) {
+    close(sockdata->fd);
+    sockdata->fd = -1;
+  }
+  sockdata->sockfd = -1;
+  free(sockdata->buf);
+  sockdata->blen = sockdata->bsize = sockdata->bpos = 0;
+}
+
+void read_data(struct send_data* sockdata) {
+  if (sockdata->blen == 0 && sockdata->fd != -1) {
+    sockdata->blen = read(sockdata->fd, sockdata->buf, sockdata->bsize);
+    sockdata->bpos = 0;
+    if (sockdata->blen == 0) {
+      close(sockdata->fd);
+      sockdata->fd = -1;
+    }
+  }
+}
+
+bool find_sockdata(int sockfd, struct send_data sockdata[], int arrlen,
+                  struct send_data** out) {
+  struct send_data* found = NULL;
+  struct send_data* fempty = NULL;
+  for (int i = 0; i < arrlen && found == NULL; i++) {
+    if (fempty == NULL && sockdata[i].sockfd == -1)
+      fempty = &(sockdata[i]);
+    if (sockdata[i].sockfd == sockfd)
+      found = &(sockdata[i]);
+  }
+
+  if (found != NULL)
+    (*out) = found;
+  else
+    (*out) = fempty;
+
+  return found != NULL;
+}
+
+void continue_transmit(struct send_data* sockdata) {
+  int written = 0;
+
+  do {
+    read_data(sockdata);
+    int left_size = sockdata->blen - sockdata->bpos;
+
+    while (left_size && written >= 0) {
+      char* wrtpos = sockdata->buf + sockdata->bpos;
+
+      written = write(sockdata->sockfd, wrtpos, left_size);
+      if (written >= 0) {
+        sockdata->bpos += written;
+        left_size = sockdata->blen - sockdata->bpos;
+      }
+    }
+  } while ((sockdata->fd != -1 || sockdata->bpos != sockdata->blen) &&
+    written >= 0);
+
+  if (sockdata->fd == -1 && sockdata->bpos == sockdata->blen) {
+    puts("End of transmission");
+    sockdata_fin(sockdata);
+  } else {
+    switch(errno) {
+      case EPIPE:
+        puts("EPIPE"); break;
+      case EAGAIN:
+        puts("EAGAIN"); break;
+      default:
+        puts("Unknown error on write"); break;
+    }
+  }
+
+}
+
+int getfd_for_path(char* req_path, struct stat* file_stat, bool* is_dir) {
   int fd = open(req_path, O_RDONLY);
 
   if (fd != -1) {
     fstat(fd, file_stat);
     if (S_ISDIR (file_stat->st_mode)) {
+      (*is_dir) = true;
       strcat(req_path, "/index.html");
       fd = open(req_path, O_RDONLY);
       fstat(fd, file_stat);
@@ -130,12 +244,13 @@ void get_mime_for_path(char* file_path, char* mime_buf) {
 }
 
 void write_file_response(char* req_path, int sockfd) {
-  char mime[64];
-
   struct stat file_stat;
-  int fd = getfd_for_path(req_path, &file_stat);
+  bool is_dir = false;
+  int fd = getfd_for_path(req_path, &file_stat, &is_dir);
+  puts(req_path);
 
   if (fd != -1) {
+    char mime[64];
     int file_len = file_stat.st_size;
     get_mime_for_path(req_path, mime);
     write_header(sockfd, 200, "OK", file_len, mime);
@@ -157,7 +272,30 @@ void write_file_response(char* req_path, int sockfd) {
 
     close(fd);
   } else {
-    write_404(sockfd);
+    if (is_dir)
+      write_403(sockfd);
+    else
+      write_404(sockfd);
+  }
+}
+
+void write_file_info(char* req_path, int sockfd) {
+  struct stat file_stat;
+  bool is_dir = false;
+  int fd = getfd_for_path(req_path, &file_stat, &is_dir);
+  close(fd);
+  puts(req_path);
+
+  if (fd != -1) {
+    char mime[64];
+    int file_len = file_stat.st_size;
+    get_mime_for_path(req_path, mime);
+
+    const char* ok_string = "OK";
+    write_header(sockfd, 200, ok_string, file_len, mime);
+  } else {
+    const char* not_found = "Not Found";
+    write_header(sockfd, 404, not_found, 0, "");
   }
 }
 
@@ -208,6 +346,17 @@ void replace_percents(char* path, int path_len) {
   strcpy(path, buf);
 }
 
+void omit_query(char* path) {
+  int i = 0;
+  char c = path[i];
+  while (c != '\0') {
+    if (c == '?')
+      c = path[i] = '\0';
+    else
+      c = path[++i];
+  }
+}
+
 struct initvals {
   int nCPU;
   char root_dir[256];
@@ -218,26 +367,82 @@ const struct initvals DEFAULT_INITIALS = {
   4, "/home/mihanik/Desktop/Hedgehog HTTP Server/", 8080
 };
 
+void dispatch_GET(const char* request, int req_len, int sockfd,
+  struct initvals* inits);
+void dispatch_POST(const char* request, int req_len, int sockfd,
+  struct initvals* inits);
+void dispatch_HEAD(const char* request, int req_len, int sockfd,
+  struct initvals* inits);
+void dispatch_other(const char* request, int req_len, int sockfd,
+  struct initvals* inits);
+
 void dispatch_request(const char* request, int req_len, int sockfd,
-  struct initvals inits) {
+  struct initvals* inits){
+  char req_type[8];
+  sscanf(request, "%s", req_type);
+  if (!strcmp("GET", req_type))
+    dispatch_GET(request, req_len, sockfd, inits);
+  else if (!strcmp("POST", req_type))
+    dispatch_POST(request, req_len, sockfd, inits);
+  else if (!strcmp("HEAD", req_type))
+    dispatch_HEAD(request, req_len, sockfd, inits);
+  else
+    dispatch_other(request, req_len, sockfd, inits);
+}
+
+void dispatch_GET(const char* request, int req_len, int sockfd,
+  struct initvals* inits) {
   if (req_len > 0) {
     char req_path[512];
     sscanf(request, "GET %412s HTTP/1.1\n", req_path);
 
     int len = strlen(req_path);
     replace_percents(req_path, len);
+    omit_query(req_path);
+    puts(req_path);
 
     if (!strstr(req_path, "..")) {
       char path[256];
-      strcpy(path, inits.root_dir);
+      strcpy(path, inits->root_dir);
       strcat(path, req_path);
 
       write_file_response(path, sockfd);
     } else {
       write_400(sockfd);
     }
-    close(sockfd);
   }
+  close(sockfd);
+}
+
+void dispatch_POST(const char* request, int req_len, int sockfd,
+  struct initvals* inits) {
+  write_400(sockfd);
+}
+
+void dispatch_HEAD(const char* request, int req_len, int sockfd,
+  struct initvals* inits) {
+  if (req_len > 0) {
+    char req_path[512];
+    sscanf(request, "HEAD %412s HTTP/1.1\n", req_path);
+
+    int len = strlen(req_path);
+    replace_percents(req_path, len);
+    omit_query(req_path);
+
+    if (!strstr(req_path, "..")) {
+      char path[256];
+      strcpy(path, inits->root_dir);
+      strcat(path, req_path);
+
+      write_file_info(path, sockfd);
+    }
+  }
+  close(sockfd);
+}
+
+void dispatch_other(const char* request, int req_len, int sockfd,
+  struct initvals* inits) {
+  write_501(sockfd);
 }
 
 typedef void (*initializer)(int, int*, char**, struct initvals*);
@@ -264,6 +469,7 @@ void initialize(int argc, char** argv,
   int i = 1;
   while (i < argc) {
     for (int j = 0; j < argnum; j++) {
+      puts(argv[i]);
       if (!strcmp(argv[i], arguments[j])) {
         initializers[j](argc, &i, argv, out);
         break;
@@ -290,7 +496,7 @@ int main(int argc, char** argv) {
   struct initvals inits = DEFAULT_INITIALS;
   const char* arguments[] = {"-r", "-c", "-p"};
   initializer initializers[] = {root_dir_init, nCPU_init, port_init};
-  initialize(argc, argv, &inits, 2, arguments, initializers);
+  initialize(argc, argv, &inits, 3, arguments, initializers);
 
   print_initial(&inits);
 
@@ -350,7 +556,7 @@ int main(int argc, char** argv) {
         }
       } else {
         int input_len = read(events[n].data.fd, buf, 245);
-        dispatch_request(buf, input_len, events[n].data.fd, inits);
+        dispatch_request(buf, input_len, events[n].data.fd, &inits);
       }
     }
   }
