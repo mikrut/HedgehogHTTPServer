@@ -1,3 +1,8 @@
 *.txt
+*.o
+*.h.gch
+*~
+DOCUMENT_ROOT/
 main
+httpd
 project_file
