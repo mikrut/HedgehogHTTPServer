@@ -64,9 +64,16 @@ int main(int argc, char** argv) {
   int epollfd, nfds;
 
   epollfd = epoll_create1(0);
+  if (epollfd == -1) {
+    perror("Could not create epollfd");
+    exit(errno);
+  }
   ev.events = EPOLLIN | EPOLLET;
   ev.data.fd = sockfd;
-  epoll_ctl(epollfd, EPOLL_CTL_ADD, sockfd, &ev);
+  if(epoll_ctl(epollfd, EPOLL_CTL_ADD, sockfd, &ev) == -1) {
+    perror("Could not add socket to epoll");
+    exit(errno);
+  }
 
   struct send_data snd_arr[128];
   sockdata_initarr(snd_arr, 128);

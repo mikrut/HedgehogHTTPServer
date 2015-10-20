@@ -40,6 +40,7 @@ Connection: close\r\n\
   char* header = (char*) malloc(sizeof(char) * header_size);
   sprintf(header, response_header_template, status_code, status_string,
           content_length, content_type);
+  printf("sum: %d\n", content_length+strlen(header));
 
   sockdata_set_string(snd_record, header);
   free(header);
