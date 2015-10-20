@@ -17,6 +17,7 @@ void sockdata_initarr(struct send_data sockdata[], int arr_len) {
     sockdata[i].fd = -1;
     sockdata[i].buf = NULL;
     sockdata[i].blen = sockdata[i].bpos = sockdata[i].bsize = 0;
+    sockdata[i].waited = false;
   }
 }
 
@@ -26,6 +27,7 @@ void sockdata_init(struct send_data* sockdata, int fd, int sockfd) {
   sockdata->blen = sockdata->bpos = 0;
   sockdata->fd = fd;
   sockdata->sockfd = sockfd;
+  sockdata->waited = false;
 }
 
 /*** THIS CODE IS FROM stackoverflow.com ***/
@@ -89,14 +91,14 @@ bool flushSocketBeforeClose(int fd, double timeout) {
 
 /*** END OF stackoverflow.com CODE ***/
 
-void sockdata_fin(struct send_data* sockdata) {
+void sockdata_fin(struct send_data* sockdata, int *snd_waitors) {
   printf("finalize socket=%d fd=%d\n", sockdata->sockfd, sockdata->fd);
   if (sockdata->fd != -1) {
     close(sockdata->fd);
     sockdata->fd = -1;
   }
   if (sockdata->sockfd != -1) {
-    flushSocketBeforeClose(sockdata->sockfd, 2.0);
+    flushSocketBeforeClose(sockdata->sockfd, 0.05);
     closeSocket(sockdata->sockfd);
     sockdata->sockfd = -1;
   }
@@ -105,6 +107,9 @@ void sockdata_fin(struct send_data* sockdata) {
     sockdata->buf = NULL;
   }
   sockdata->blen = sockdata->bsize = sockdata->bpos = 0;
+  if (sockdata->waited)
+    (*snd_waitors)--;
+  sockdata->waited = false;
 }
 
 void read_data(struct send_data* sockdata) {
@@ -151,19 +156,20 @@ void sockdata_append(struct send_data* sockdata, const char* str) {
   sockdata->blen += len;
 }
 
-void continue_transmit(struct send_data* sockdata) {
+void continue_transmit(struct send_data* sockdata, int *snd_waitors) {
   int written = 0;
-  printf("continue transmit fd=%d sockfd=%d\n", sockdata->fd, sockdata->sockfd);
-  int total = 0;
+  int steps_count = 0;
+  const int max_steps = 5;
 
   do {
     read_data(sockdata);
     int left_size = sockdata->blen - sockdata->bpos;
 
-    while (left_size && written >= 0) {
+    while (left_size && written >= 0 && steps_count <= max_steps) {
       char* wrtpos = sockdata->buf + sockdata->bpos;
       written = send(sockdata->sockfd, wrtpos, left_size, MSG_NOSIGNAL);
-      total+=written;
+      steps_count++;
+
 
       if (written >= 0) {
         sockdata->bpos += written;
@@ -171,13 +177,11 @@ void continue_transmit(struct send_data* sockdata) {
       }
     }
   } while ((sockdata->fd != -1 || sockdata->bpos != sockdata->blen) &&
-    written >= 0);
-  printf("totally written: %d for fd=%d\n", total, sockdata->fd);
+    written >= 0 && steps_count <= max_steps);
 
   if ((sockdata->fd == -1) && (sockdata->bpos == sockdata->blen)) {
-    puts("End of transmission");
-    sockdata_fin(sockdata);
-  } else {
+    sockdata_fin(sockdata, snd_waitors);
+  } else if (written == -1) {
     switch(errno) {
       case EAGAIN: case EINTR:
         puts("EAGAIN or EINTR");break;
@@ -185,9 +189,13 @@ void continue_transmit(struct send_data* sockdata) {
         puts("EPIPE");
       default:
         puts("Error on write");
-        sockdata_fin(sockdata);
+        sockdata_fin(sockdata, snd_waitors);
     }
-
+  } else {
+    if (!sockdata->waited) {
+      (*snd_waitors)++;
+      sockdata->waited = true;
+    }
   }
 
 }

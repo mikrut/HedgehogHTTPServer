@@ -11,14 +11,14 @@
 #include "write.h"
 
 void dispatch_request(int sockfd, struct initvals* inits,
-  struct send_data snd_arr[], int snd_len){
+  struct send_data snd_arr[], int snd_len, int *snd_waitors){
 
   struct send_data* snd_record;
   bool found = find_sockdata(sockfd, snd_arr, snd_len, &snd_record);
   if (!found) {
     dispatch_new_request(sockfd, inits, snd_record);
   }
-  continue_transmit(snd_record);
+  continue_transmit(snd_record, snd_waitors);
 }
 
 void dispatch_new_request(int sockfd, struct initvals* inits,
@@ -27,7 +27,7 @@ void dispatch_new_request(int sockfd, struct initvals* inits,
   int req_len = read(sockfd, request, 245);
 
   char req_type[8];
-  sscanf(request, "%7s", req_type);
+  sscanf(request, "%s", req_type);
   if (!strcmp("GET", req_type))
     dispatch_GET(request, req_len, sockfd, inits, snd_record);
   else if (!strcmp("POST", req_type))

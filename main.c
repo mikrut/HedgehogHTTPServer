@@ -76,10 +76,17 @@ int main(int argc, char** argv) {
   }
 
   struct send_data snd_arr[128];
+  int snd_arr_waiting = 0;
   sockdata_initarr(snd_arr, 128);
 
   for(;;) {
-    nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
+    int timeout = -1;
+    if (snd_arr_waiting > 0) {
+      timeout = 500 - snd_arr_waiting * 45;
+      if (timeout < 0)
+        timeout = 100;
+    }
+    nfds = epoll_wait(epollfd, events, MAX_EVENTS, timeout);
 
     int n;
     for (n = 0; n < nfds; n++) {
@@ -88,6 +95,7 @@ int main(int argc, char** argv) {
           struct sockaddr_in client;
           int addrlen = sizeof(client);
           int acc = accept(sockfd, (struct sockaddr*) &client, (socklen_t*) &addrlen);
+
           if (-1 == acc) {
             if ((errno == EAGAIN) ||
                 (errno == EWOULDBLOCK)) {
@@ -104,7 +112,13 @@ int main(int argc, char** argv) {
           epoll_ctl(epollfd, EPOLL_CTL_ADD, acc, &ev);
         }
       } else {
-        dispatch_request(events[n].data.fd, &inits, snd_arr, 128);
+        dispatch_request(events[n].data.fd, &inits, snd_arr, 128, &snd_arr_waiting);
+      }
+    }
+
+    for (int i = 0; i < 128; i++) {
+      if (snd_arr[i].sockfd > 0) {
+        continue_transmit(&snd_arr[i], &snd_arr_waiting);
       }
     }
   }
