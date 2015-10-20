@@ -30,6 +30,118 @@ struct send_data {
   int blen;
 };
 
+void sockdata_initarr(struct send_data sockdata[], int arr_len) {
+  for (int i = 0; i < arr_len; i++) {
+    sockdata[i].sockfd = -1;
+    sockdata[i].fd = -1;
+    sockdata[i].buf = NULL;
+    sockdata[i].blen = sockdata[i].bpos = sockdata[i].bsize = 0;
+  }
+}
+
+void sockdata_init(struct send_data* sockdata, int fd, int sockfd) {
+  sockdata->bsize = 1024;
+  sockdata->buf = malloc(sizeof(char) * sockdata->bsize);
+  sockdata->blen = sockdata->bpos = 0;
+  sockdata->fd = fd;
+  sockdata->sockfd = sockfd;
+}
+
+void sockdata_fin(struct send_data* sockdata) {
+  if (sockdata->fd != -1) {
+    close(sockdata->fd);
+    sockdata->fd = -1;
+  }
+  close(sockdata->sockfd);
+  sockdata->sockfd = -1;
+  free(sockdata->buf);
+  sockdata->blen = sockdata->bsize = sockdata->bpos = 0;
+}
+
+void read_data(struct send_data* sockdata) {
+  if (sockdata->blen == sockdata->bpos && sockdata->fd != -1) {
+    sockdata->blen = read(sockdata->fd, sockdata->buf, sockdata->bsize);
+    sockdata->bpos = 0;
+    if (sockdata->blen == 0) {
+      close(sockdata->fd);
+      sockdata->fd = -1;
+    }
+  }
+}
+
+bool find_sockdata(int sockfd, struct send_data sockdata[], int arrlen,
+                  struct send_data** out) {
+  struct send_data* found = NULL;
+  struct send_data* fempty = NULL;
+  for (int i = 0; i < arrlen && found == NULL; i++) {
+    if (fempty == NULL && sockdata[i].sockfd == -1)
+      fempty = &(sockdata[i]);
+    if (sockdata[i].sockfd == sockfd)
+      found = &(sockdata[i]);
+  }
+
+  if (found != NULL)
+    (*out) = found;
+  else
+    (*out) = fempty;
+
+  return found != NULL;
+}
+
+void sockdata_set_string(struct send_data* sockdata, const char* str) {
+  strncpy(sockdata->buf, str, sockdata->bsize);
+  int len = strnlen(str, sockdata->bsize);
+  sockdata->blen = len;
+  sockdata->bpos = 0;
+}
+
+void sockdata_append(struct send_data* sockdata, const char* str) {
+  int left = sockdata->bsize - sockdata->blen;
+  int len = strnlen(str, left);
+  strncat(sockdata->buf, str, left);
+  sockdata->blen += len;
+}
+
+void continue_transmit(struct send_data* sockdata) {
+  int written = 0;
+  puts("continue transmit");
+
+  do {
+    read_data(sockdata);
+    printf("fd=%d blen=%d bpos=%d\n", sockdata->fd, sockdata->blen, sockdata->bpos);
+    int left_size = sockdata->blen - sockdata->bpos;
+
+    while (left_size && written >= 0) {
+      char* wrtpos = sockdata->buf + sockdata->bpos;
+
+      written = send(sockdata->sockfd, wrtpos, left_size, MSG_NOSIGNAL);
+      puts(wrtpos);
+
+      if (written >= 0) {
+        sockdata->bpos += written;
+        left_size = sockdata->blen - sockdata->bpos;
+      }
+    }
+  } while ((sockdata->fd != -1 || sockdata->bpos != sockdata->blen) &&
+    written >= 0);
+
+  if ((sockdata->fd == -1) && (sockdata->bpos == sockdata->blen)) {
+    puts("End of transmission");
+    sockdata_fin(sockdata);
+  } else {
+    switch(errno) {
+      case EPIPE:
+        puts("EPIPE"); break;
+      case EAGAIN:
+        puts("EAGAIN"); break;
+      default:
+        puts("Unknown error on write"); break;
+    }
+    sockdata_fin(sockdata);
+  }
+
+}
+
 const int ext_cmp_len = 5;
 
 int in(const char** array, int arr_len, const char* str) {
@@ -71,7 +183,7 @@ void ext_to_mime(const char* _ext, char* result) {
   }
 }
 
-void write_header(int sockfd,
+void write_header(struct send_data* snd_record,
                  int status_code, const char* status_string,
                  int content_length, const char* content_type) {
   char response_header_template[] = "\
@@ -82,141 +194,59 @@ Content-Length: %d\r\n\
 Content-Type: %s\r\n\
 Connection: close\r\n\
 \r\n";
-  int header_size = strlen(response_header_template) + 4 + 10 + strlen(content_type);
+  int header_size = strlen(response_header_template) + strlen(content_type) + 50;
   char* header = (char*) malloc(sizeof(char) * header_size);
   sprintf(header, response_header_template, status_code, status_string,
           content_length, content_type);
-  int header_true_len = strlen(header);
 
-  write(sockfd, header, header_true_len);
+  sockdata_set_string(snd_record, header);
   free(header);
 }
 
-void write_response(int sockfd,
+void write_response(int sockfd, struct send_data* snd_record,
                     int status_code, const char* status_string,
                     const char* content_type,
                     const char* buf, size_t buflen) {
-  write_header(sockfd, status_code, status_string, buflen, content_type);
-  write(sockfd, buf, buflen);
+  sockdata_init(snd_record, -1, sockfd);
+
+  write_header(snd_record, status_code, status_string, buflen, content_type);
+  sockdata_append(snd_record, buf);
 }
 
-void write_400(int sockfd) {
+void write_400(int sockfd, struct send_data* snd_record) {
   const char bad_request_message[] =
       "Bad request. Try something else.";
-  write_response(sockfd,
+  write_response(sockfd, snd_record,
     400, "Bad request",
     "text/plain",
-    bad_request_message, sizeof(bad_request_message));
+    bad_request_message, sizeof(bad_request_message) - 1);
 }
 
-void write_403(int sockfd) {
+void write_403(int sockfd, struct send_data* snd_record) {
   const char forbidden_message[] =
       "Access to this directory is forbidden!";
-  write_response(sockfd,
+  write_response(sockfd, snd_record,
     403, "Forbidden",
     "text/plain",
-    forbidden_message, sizeof(forbidden_message));
+    forbidden_message, sizeof(forbidden_message) - 1);
 }
 
-void write_404(int sockfd) {
+void write_404(int sockfd, struct send_data* snd_record) {
   const char not_found_message[] =
       "Requested file was not found on this server";
-  write_response(sockfd,
+  write_response(sockfd, snd_record,
     404, "Not Found",
     "text/plain",
-    not_found_message, sizeof(not_found_message));
+    not_found_message, sizeof(not_found_message) -1);
 }
 
-void write_501(int sockfd) {
+void write_501(int sockfd, struct send_data* snd_record) {
  const char not_implemented_message[] =
       "This method is not implemented or is unknown for server";
-  write_response(sockfd,
+  write_response(sockfd, snd_record,
     501, "Not Implemented",
     "text/plain",
-    not_implemented_message, sizeof(not_implemented_message));
-}
-
-void sockdata_init(struct send_data* sockdata, int fd, int sockfd) {
-  sockdata->bsize = 1024;
-  sockdata->buf = malloc(sizeof(char) * sockdata->bsize);
-  sockdata->blen = sockdata->bpos = 0;
-  sockdata->fd = fd;
-  sockdata->sockfd = sockfd;
-}
-
-void sockdata_fin(struct send_data* sockdata) {
-  if (sockdata->fd != -1) {
-    close(sockdata->fd);
-    sockdata->fd = -1;
-  }
-  sockdata->sockfd = -1;
-  free(sockdata->buf);
-  sockdata->blen = sockdata->bsize = sockdata->bpos = 0;
-}
-
-void read_data(struct send_data* sockdata) {
-  if (sockdata->blen == 0 && sockdata->fd != -1) {
-    sockdata->blen = read(sockdata->fd, sockdata->buf, sockdata->bsize);
-    sockdata->bpos = 0;
-    if (sockdata->blen == 0) {
-      close(sockdata->fd);
-      sockdata->fd = -1;
-    }
-  }
-}
-
-bool find_sockdata(int sockfd, struct send_data sockdata[], int arrlen,
-                  struct send_data** out) {
-  struct send_data* found = NULL;
-  struct send_data* fempty = NULL;
-  for (int i = 0; i < arrlen && found == NULL; i++) {
-    if (fempty == NULL && sockdata[i].sockfd == -1)
-      fempty = &(sockdata[i]);
-    if (sockdata[i].sockfd == sockfd)
-      found = &(sockdata[i]);
-  }
-
-  if (found != NULL)
-    (*out) = found;
-  else
-    (*out) = fempty;
-
-  return found != NULL;
-}
-
-void continue_transmit(struct send_data* sockdata) {
-  int written = 0;
-
-  do {
-    read_data(sockdata);
-    int left_size = sockdata->blen - sockdata->bpos;
-
-    while (left_size && written >= 0) {
-      char* wrtpos = sockdata->buf + sockdata->bpos;
-
-      written = write(sockdata->sockfd, wrtpos, left_size);
-      if (written >= 0) {
-        sockdata->bpos += written;
-        left_size = sockdata->blen - sockdata->bpos;
-      }
-    }
-  } while ((sockdata->fd != -1 || sockdata->bpos != sockdata->blen) &&
-    written >= 0);
-
-  if (sockdata->fd == -1 && sockdata->bpos == sockdata->blen) {
-    puts("End of transmission");
-    sockdata_fin(sockdata);
-  } else {
-    switch(errno) {
-      case EPIPE:
-        puts("EPIPE"); break;
-      case EAGAIN:
-        puts("EAGAIN"); break;
-      default:
-        puts("Unknown error on write"); break;
-    }
-  }
-
+    not_implemented_message, sizeof(not_implemented_message) - 1);
 }
 
 int getfd_for_path(char* req_path, struct stat* file_stat, bool* is_dir) {
@@ -243,48 +273,37 @@ void get_mime_for_path(char* file_path, char* mime_buf) {
   }
 }
 
-void write_file_response(char* req_path, int sockfd) {
+void write_file_response(char* req_path, int sockfd,
+  struct send_data* snd_record) {
+
   struct stat file_stat;
   bool is_dir = false;
   int fd = getfd_for_path(req_path, &file_stat, &is_dir);
   puts(req_path);
 
   if (fd != -1) {
+    sockdata_init(snd_record, fd, sockfd);
+
     char mime[64];
     int file_len = file_stat.st_size;
     get_mime_for_path(req_path, mime);
-    write_header(sockfd, 200, "OK", file_len, mime);
 
-    const int READ_BUF_SIZE = 1024;
-    char read_buf[READ_BUF_SIZE];
-    int read_size, left_size;
-
-    do {
-      left_size = read_size = read(fd, read_buf, READ_BUF_SIZE);
-      char* p = read_buf;
-
-      while(left_size) {
-        int written = write(sockfd, read_buf, read_size);
-        left_size -= written;
-        p += written;
-      }
-    } while(read_size > 0);
-
-    close(fd);
+    write_header(snd_record, 200, "OK", file_len, mime);
   } else {
     if (is_dir)
-      write_403(sockfd);
+      write_403(sockfd, snd_record);
     else
-      write_404(sockfd);
+      write_404(sockfd, snd_record);
   }
 }
 
-void write_file_info(char* req_path, int sockfd) {
+void write_file_info(char* req_path, int sockfd, struct send_data* snd_record) {
   struct stat file_stat;
   bool is_dir = false;
   int fd = getfd_for_path(req_path, &file_stat, &is_dir);
   close(fd);
   puts(req_path);
+  sockdata_init(snd_record, -1, sockfd);
 
   if (fd != -1) {
     char mime[64];
@@ -292,10 +311,10 @@ void write_file_info(char* req_path, int sockfd) {
     get_mime_for_path(req_path, mime);
 
     const char* ok_string = "OK";
-    write_header(sockfd, 200, ok_string, file_len, mime);
+    write_header(snd_record, 200, ok_string, file_len, mime);
   } else {
     const char* not_found = "Not Found";
-    write_header(sockfd, 404, not_found, 0, "");
+    write_header(snd_record, 404, not_found, 0, "");
   }
 }
 
@@ -367,31 +386,49 @@ const struct initvals DEFAULT_INITIALS = {
   4, "/home/mihanik/Desktop/Hedgehog HTTP Server/", 8080
 };
 
-void dispatch_GET(const char* request, int req_len, int sockfd,
-  struct initvals* inits);
-void dispatch_POST(const char* request, int req_len, int sockfd,
-  struct initvals* inits);
-void dispatch_HEAD(const char* request, int req_len, int sockfd,
-  struct initvals* inits);
-void dispatch_other(const char* request, int req_len, int sockfd,
-  struct initvals* inits);
+void dispatch_new_request(int sockfd, struct initvals* inits,
+  struct send_data* snd_record);
 
-void dispatch_request(const char* request, int req_len, int sockfd,
-  struct initvals* inits){
-  char req_type[8];
-  sscanf(request, "%s", req_type);
-  if (!strcmp("GET", req_type))
-    dispatch_GET(request, req_len, sockfd, inits);
-  else if (!strcmp("POST", req_type))
-    dispatch_POST(request, req_len, sockfd, inits);
-  else if (!strcmp("HEAD", req_type))
-    dispatch_HEAD(request, req_len, sockfd, inits);
-  else
-    dispatch_other(request, req_len, sockfd, inits);
+void dispatch_request(int sockfd, struct initvals* inits,
+  struct send_data snd_arr[], int snd_len){
+
+  struct send_data* snd_record;
+  bool found = find_sockdata(sockfd, snd_arr, snd_len, &snd_record);
+  if (!found) {
+    dispatch_new_request(sockfd, inits, snd_record);
+  }
+  continue_transmit(snd_record);
 }
 
 void dispatch_GET(const char* request, int req_len, int sockfd,
-  struct initvals* inits) {
+  struct initvals* inits, struct send_data* snd_record);
+void dispatch_POST(const char* request, int req_len, int sockfd,
+  struct initvals* inits, struct send_data* snd_record);
+void dispatch_HEAD(const char* request, int req_len, int sockfd,
+  struct initvals* inits, struct send_data* snd_record);
+void dispatch_other(const char* request, int req_len, int sockfd,
+  struct initvals* inits, struct send_data* snd_record);
+
+void dispatch_new_request(int sockfd, struct initvals* inits,
+  struct send_data* snd_record) {
+  char request[256];
+  int req_len = read(sockfd, request, 245);
+
+  char req_type[8];
+  sscanf(request, "%s", req_type);
+  if (!strcmp("GET", req_type))
+    dispatch_GET(request, req_len, sockfd, inits, snd_record);
+  else if (!strcmp("POST", req_type))
+    dispatch_POST(request, req_len, sockfd, inits, snd_record);
+  else if (!strcmp("HEAD", req_type))
+    dispatch_HEAD(request, req_len, sockfd, inits, snd_record);
+  else
+    dispatch_other(request, req_len, sockfd, inits, snd_record);
+
+}
+
+void dispatch_GET(const char* request, int req_len, int sockfd,
+  struct initvals* inits, struct send_data* snd_record) {
   if (req_len > 0) {
     char req_path[512];
     sscanf(request, "GET %412s HTTP/1.1\n", req_path);
@@ -406,21 +443,20 @@ void dispatch_GET(const char* request, int req_len, int sockfd,
       strcpy(path, inits->root_dir);
       strcat(path, req_path);
 
-      write_file_response(path, sockfd);
+      write_file_response(path, sockfd, snd_record);
     } else {
-      write_400(sockfd);
+      write_400(sockfd, snd_record);
     }
   }
-  close(sockfd);
 }
 
 void dispatch_POST(const char* request, int req_len, int sockfd,
-  struct initvals* inits) {
-  write_400(sockfd);
+  struct initvals* inits, struct send_data* snd_record) {
+  write_400(sockfd, snd_record);
 }
 
 void dispatch_HEAD(const char* request, int req_len, int sockfd,
-  struct initvals* inits) {
+  struct initvals* inits, struct send_data* snd_record) {
   if (req_len > 0) {
     char req_path[512];
     sscanf(request, "HEAD %412s HTTP/1.1\n", req_path);
@@ -434,15 +470,16 @@ void dispatch_HEAD(const char* request, int req_len, int sockfd,
       strcpy(path, inits->root_dir);
       strcat(path, req_path);
 
-      write_file_info(path, sockfd);
+      write_file_info(path, sockfd, snd_record);
     }
+  } else {
+    write_400(sockfd, snd_record);
   }
-  close(sockfd);
 }
 
 void dispatch_other(const char* request, int req_len, int sockfd,
-  struct initvals* inits) {
-  write_501(sockfd);
+  struct initvals* inits, struct send_data* snd_record) {
+  write_501(sockfd, snd_record);
 }
 
 typedef void (*initializer)(int, int*, char**, struct initvals*);
@@ -526,8 +563,8 @@ int main(int argc, char** argv) {
   ev.data.fd = sockfd;
   epoll_ctl(epollfd, EPOLL_CTL_ADD, sockfd, &ev);
 
-  char buf[256];
-  memset(buf, 256, 0);
+  struct send_data snd_arr[128];
+  sockdata_initarr(snd_arr, 128);
 
   for(;;) {
     nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
@@ -555,8 +592,7 @@ int main(int argc, char** argv) {
           epoll_ctl(epollfd, EPOLL_CTL_ADD, acc, &ev);
         }
       } else {
-        int input_len = read(events[n].data.fd, buf, 245);
-        dispatch_request(buf, input_len, events[n].data.fd, &inits);
+        dispatch_request(events[n].data.fd, &inits, snd_arr, 128);
       }
     }
   }
