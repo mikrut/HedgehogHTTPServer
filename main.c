@@ -26,6 +26,8 @@ int setnonblocking(int fd) {
 }
 
 int main(int argc, char** argv) {
+  const int MAX_EVENTS_PER_PROCESS = 10;
+
   struct initvals inits;
   init_params(argc, argv, &inits);
   print_initial(&inits);
@@ -48,7 +50,7 @@ int main(int argc, char** argv) {
     exit(errno);
   }
   setnonblocking(sockfd);
-  if(listen(sockfd, 5) == -1) {
+  if(listen(sockfd, MAX_EVENTS_PER_PROCESS*inits.nCPU) == -1) {
     perror("Could not listen a socket");
     exit(errno);
   }
@@ -59,8 +61,7 @@ int main(int argc, char** argv) {
       break;
   }
 
-  const int MAX_EVENTS = 10;
-  struct epoll_event ev, events[MAX_EVENTS];
+  struct epoll_event ev, events[MAX_EVENTS_PER_PROCESS];
   int epollfd, nfds;
 
   epollfd = epoll_create1(0);
@@ -75,18 +76,18 @@ int main(int argc, char** argv) {
     exit(errno);
   }
 
-  struct send_data snd_arr[128];
+  struct send_data snd_arr[MAX_EVENTS_PER_PROCESS];
   int snd_arr_waiting = 0;
-  sockdata_initarr(snd_arr, 128);
+  sockdata_initarr(snd_arr, MAX_EVENTS_PER_PROCESS);
 
   for(;;) {
     int timeout = -1;
     if (snd_arr_waiting > 0) {
-      timeout = 500 - snd_arr_waiting * 45;
-      if (timeout < 0)
+      timeout = 500 - snd_arr_waiting * (500 / MAX_EVENTS_PER_PROCESS);
+      if (timeout <= 0)
         timeout = 100;
     }
-    nfds = epoll_wait(epollfd, events, MAX_EVENTS, timeout);
+    nfds = epoll_wait(epollfd, events, MAX_EVENTS_PER_PROCESS, timeout);
 
     int n;
     for (n = 0; n < nfds; n++) {
@@ -112,13 +113,17 @@ int main(int argc, char** argv) {
           epoll_ctl(epollfd, EPOLL_CTL_ADD, acc, &ev);
         }
       } else {
-        dispatch_request(events[n].data.fd, &inits, snd_arr, 128, &snd_arr_waiting);
+        dispatch_request(events[n].data.fd, &inits, snd_arr, MAX_EVENTS_PER_PROCESS, &snd_arr_waiting);
       }
     }
 
-    for (int i = 0; i < 128; i++) {
-      if (snd_arr[i].sockfd > 0) {
+    int contr_ctr;
+    for (int i = 0; i < MAX_EVENTS_PER_PROCESS; i++) {
+      contr_ctr = 0;
+      while (snd_arr[i].sockfd > 0 &&
+             contr_ctr < MAX_EVENTS_PER_PROCESS / snd_arr_waiting) {
         continue_transmit(&snd_arr[i], &snd_arr_waiting);
+        contr_ctr++;
       }
     }
   }
